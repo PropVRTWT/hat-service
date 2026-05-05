@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+from contextlib import nullcontext
 from typing import Literal
 
 import cv2
@@ -61,12 +62,37 @@ _WINDOW_SIZE = _HAT_KWARGS["window_size"]
 _models: dict[str, HAT] = {}
 _load_lock = threading.Lock()
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# We keep weights in fp32 and use torch.cuda.amp.autocast for fp16 compute.
-# Calling `.half()` on the HAT module breaks because `HAT.calculate_mask`
-# constructs a fresh fp32 attention mask at forward time and only moves it
-# to `x.device` (not `x.dtype`), which then mismatches with fp16 activations
-# ("expected scalar type Half but found Float"). Autocast sidesteps this.
-_use_autocast = torch.cuda.is_available()
+# HAT uses stacked LayerNorm + attention; fp16 autocast often overflows or
+# yields NaNs in those blocks. NaNs survive clamp_(0,1) and become 0 when cast
+# to uint8 → an all-black output image. So we run inference in full fp32.
+#
+# Optional: set HAT_INFER_DTYPE=bf16 on Ada/L4+ GPUs for a bit more headroom
+# (bfloat16 has the same exponent range as fp32 and is usually stable here).
+_infer_dtype = os.environ.get("HAT_INFER_DTYPE", "fp32").strip().lower()
+
+
+def _bf16_supported() -> bool:
+    fn = getattr(torch.cuda, "is_bf16_supported", None)
+    return bool(fn and fn())
+
+
+def _amp_context():
+    if not torch.cuda.is_available():
+        return nullcontext()
+    if _infer_dtype == "bf16" and _bf16_supported():
+        return torch.amp.autocast("cuda", dtype=torch.bfloat16)
+    if _infer_dtype in ("fp16", "half"):
+        return torch.amp.autocast("cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+def _sanitize_output(t: torch.Tensor) -> torch.Tensor:
+    """Replace NaN/Inf (broken attention / overflow) before uint8 conversion."""
+    if torch.isfinite(t).all():
+        return t
+    bad = (~torch.isfinite(t)).sum().item()
+    print(f"[HAT Service] WARNING: {bad} non-finite pixels in model output; patching.", flush=True)
+    return torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
 
 
 def _weights_dir() -> str:
@@ -112,8 +138,11 @@ def get_model(name: ModelName = "real_gan") -> HAT:
         torch.backends.cudnn.benchmark = True
 
         _models[name] = model
-        device_label = "cuda (autocast fp16)" if _use_autocast else "cpu (fp32)"
-        print(f"[HAT Service] Model '{name}' ready on {device_label}.", flush=True)
+        if _device.type == "cuda":
+            mode = f"cuda infer={_infer_dtype}"
+        else:
+            mode = "cpu infer=fp32"
+        print(f"[HAT Service] Model '{name}' ready on {mode}.", flush=True)
         return model
 
 
@@ -130,18 +159,11 @@ def _pad_to_window(x: torch.Tensor, window: int) -> tuple[torch.Tensor, int, int
     return x, pad_h, pad_w
 
 
-def _autocast_ctx():
-    """Enable fp16 autocast on CUDA, no-op on CPU."""
-    if _use_autocast:
-        return torch.cuda.amp.autocast(dtype=torch.float16)
-    return torch.cuda.amp.autocast(enabled=False)
-
-
 @torch.no_grad()
 def _forward_full(model: HAT, x: torch.Tensor) -> torch.Tensor:
-    with _autocast_ctx():
+    with _amp_context():
         out = model(x)
-    return out.float()
+    return _sanitize_output(out.float())
 
 
 @torch.no_grad()
@@ -194,9 +216,9 @@ def _forward_tiled(
             input_tile, pad_h, pad_w = _pad_to_window(input_tile, _WINDOW_SIZE)
 
             try:
-                with _autocast_ctx():
+                with _amp_context():
                     output_tile = model(input_tile)
-                output_tile = output_tile.float()
+                output_tile = _sanitize_output(output_tile.float())
             except RuntimeError as e:
                 raise RuntimeError(
                     f"HAT forward failed for tile ({tx},{ty}) "
@@ -288,7 +310,7 @@ def upscale_image(
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     tensor = torch.from_numpy(img_rgb).float().div_(255.0)
-    # Keep input in fp32; autocast inside _forward_* casts ops to fp16 as needed.
+    # fp32 tensor on device; _forward_* uses fp32 by default (see HAT_INFER_DTYPE).
     tensor = tensor.permute(2, 0, 1).unsqueeze(0).to(_device)
 
     # Snap tile_size to a multiple of window_size; clamp so a single tile is
@@ -309,7 +331,7 @@ def upscale_image(
                 : out_tensor.shape[3] - pad_w * _NATIVE_SCALE,
             ]
 
-    out_tensor = out_tensor.clamp_(0, 1).squeeze(0).cpu()
+    out_tensor = _sanitize_output(out_tensor).clamp_(0, 1).squeeze(0).cpu()
     out_rgb = (out_tensor.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
 
