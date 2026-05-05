@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx
+opencv-python-headless
+numpy
+Pillow
+pyyaml
+google-cloud-storage
+python-dotenv
