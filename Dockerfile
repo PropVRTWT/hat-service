@@ -7,17 +7,28 @@ ENV PYTHONUNBUFFERED=1
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV PORT=8080
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-venv \
-    wget \
-    git \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3 /usr/bin/python
+# Install system dependencies.
+# Apt-related flags worth knowing:
+#   Acquire::Retries=5             — survive transient mirror flakiness
+#   Acquire::http::Timeout=30      — don't hang forever on a dead mirror
+#   --fix-missing                  — keep going if a single deb fails to fetch
+#   set -e + apt-get update -y     — fail the layer loudly instead of silently
+#                                     proceeding against a half-broken index
+RUN set -eux; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    echo 'Acquire::http::Timeout "30";' > /etc/apt/apt.conf.d/80-timeout; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends --fix-missing \
+        python3 \
+        python3-pip \
+        python3-venv \
+        wget \
+        ca-certificates \
+        git \
+        libgl1-mesa-glx \
+        libglib2.0-0; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -sf /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 
