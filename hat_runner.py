@@ -61,7 +61,12 @@ _WINDOW_SIZE = _HAT_KWARGS["window_size"]
 _models: dict[str, HAT] = {}
 _load_lock = threading.Lock()
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_use_half = torch.cuda.is_available()
+# We keep weights in fp32 and use torch.cuda.amp.autocast for fp16 compute.
+# Calling `.half()` on the HAT module breaks because `HAT.calculate_mask`
+# constructs a fresh fp32 attention mask at forward time and only moves it
+# to `x.device` (not `x.dtype`), which then mismatches with fp16 activations
+# ("expected scalar type Half but found Float"). Autocast sidesteps this.
+_use_autocast = torch.cuda.is_available()
 
 
 def _weights_dir() -> str:
@@ -103,13 +108,11 @@ def get_model(name: ModelName = "real_gan") -> HAT:
         model.load_state_dict(state, strict=True)
 
         model.eval()
-        if _use_half:
-            model = model.half()
         model = model.to(_device)
         torch.backends.cudnn.benchmark = True
 
         _models[name] = model
-        device_label = "cuda" if _use_half else "cpu"
+        device_label = "cuda (autocast fp16)" if _use_autocast else "cpu (fp32)"
         print(f"[HAT Service] Model '{name}' ready on {device_label}.", flush=True)
         return model
 
@@ -127,9 +130,18 @@ def _pad_to_window(x: torch.Tensor, window: int) -> tuple[torch.Tensor, int, int
     return x, pad_h, pad_w
 
 
+def _autocast_ctx():
+    """Enable fp16 autocast on CUDA, no-op on CPU."""
+    if _use_autocast:
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return torch.cuda.amp.autocast(enabled=False)
+
+
 @torch.no_grad()
 def _forward_full(model: HAT, x: torch.Tensor) -> torch.Tensor:
-    return model(x)
+    with _autocast_ctx():
+        out = model(x)
+    return out.float()
 
 
 @torch.no_grad()
@@ -182,7 +194,9 @@ def _forward_tiled(
             input_tile, pad_h, pad_w = _pad_to_window(input_tile, _WINDOW_SIZE)
 
             try:
-                output_tile = model(input_tile)
+                with _autocast_ctx():
+                    output_tile = model(input_tile)
+                output_tile = output_tile.float()
             except RuntimeError as e:
                 raise RuntimeError(
                     f"HAT forward failed for tile ({tx},{ty}) "
@@ -274,9 +288,8 @@ def upscale_image(
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     tensor = torch.from_numpy(img_rgb).float().div_(255.0)
+    # Keep input in fp32; autocast inside _forward_* casts ops to fp16 as needed.
     tensor = tensor.permute(2, 0, 1).unsqueeze(0).to(_device)
-    if _use_half:
-        tensor = tensor.half()
 
     # Snap tile_size to a multiple of window_size; clamp so a single tile is
     # never smaller than the window itself.
@@ -296,7 +309,7 @@ def upscale_image(
                 : out_tensor.shape[3] - pad_w * _NATIVE_SCALE,
             ]
 
-    out_tensor = out_tensor.clamp_(0, 1).squeeze(0).float().cpu()
+    out_tensor = out_tensor.clamp_(0, 1).squeeze(0).cpu()
     out_rgb = (out_tensor.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
 
